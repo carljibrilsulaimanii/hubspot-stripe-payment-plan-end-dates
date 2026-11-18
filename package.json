@@ -1,0 +1,12 @@
+{
+  "name": "hubspot-stripe-payment-plan-end-dates",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Make Stripe payment plans stop after their last payment, set from a HubSpot workflow. Zero dependencies to test.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
