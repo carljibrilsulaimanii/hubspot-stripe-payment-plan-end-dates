@@ -22,6 +22,16 @@ exactly N payments, with no partial charge.
 It's for teams that take Stripe payments outside HubSpot Commerce and run their
 follow-up in HubSpot, using HubSpot's Stripe Data Sync to bring payments in.
 
+There are two ways to set it up:
+
+- **Part 1, the plan list in code** (Steps 1-6): one workflow, with your plans listed
+  in the custom code. Quick to set up; each new plan is a one-line code change.
+- **Part 2, the rules table** (Steps 7-12): a **Payment Product Config** custom object
+  holds one record per plan price, with its number of payments. A workflow reads the
+  rule for every new subscription, creates a draft rule for any price it doesn't know,
+  and a daily check sets any missing end date and reports anything off. Adding a plan
+  is a record, not a code change.
+
 ## Why it exists
 
 **Stripe doesn't know a payment plan has an end.**
@@ -76,8 +86,9 @@ date is there, every later run returns `ALREADY_SET`.
 
 | Path | What it is | Where it goes |
 |---|---|---|
-| [`workflow-action/`](workflow-action/) | The custom code action | Pasted into the workflow (Step 4) |
-| [`test/`](test/) | Offline tests with Stripe faked and the clock frozen | `npm test` |
+| [`workflow-action/payment-plan-end-date.js`](workflow-action/payment-plan-end-date.js) | Part 1: the action with the plan list in code | Pasted into the workflow (Step 4) |
+| [`workflow-action/rules/`](workflow-action/rules/) | Part 2: the action that reads the rules table, and the daily check | Pasted into the two Part 2 workflows (Steps 10 and 11) |
+| [`test/`](test/) | Offline tests with Stripe and HubSpot faked and the clock frozen | `npm test` |
 
 ## Table of contents
 
@@ -89,6 +100,13 @@ date is there, every later run returns `ALREADY_SET`.
   - [Step 4: The workflow](#step-4-the-workflow)
   - [Step 5: Turn it on and fix past buyers](#step-5-turn-it-on-and-fix-past-buyers)
   - [Step 6: Adding a plan later](#step-6-adding-a-plan-later)
+- [Part 2: the rules table](#part-2-the-rules-table)
+  - [Step 7: The Payment Product Config object](#step-7-the-payment-product-config-object)
+  - [Step 8: Rules for your plans and the Global record](#step-8-rules-for-your-plans-and-the-global-record)
+  - [Step 9: A HubSpot service key and the second secret](#step-9-a-hubspot-service-key-and-the-second-secret)
+  - [Step 10: Workflow "Payment plans - Set end date"](#step-10-workflow-payment-plans---set-end-date)
+  - [Step 11: Workflow "Payment plans - Daily check"](#step-11-workflow-payment-plans---daily-check)
+  - [Step 12: Switch over from Part 1 and turn on write mode](#step-12-switch-over-from-part-1-and-turn-on-write-mode)
 - [How the end date is worked out](#how-the-end-date-is-worked-out)
 - [Troubleshooting](#troubleshooting)
 - [Limits](#limits)
@@ -104,7 +122,10 @@ date is there, every later run returns `ALREADY_SET`.
 | HubSpot | Workflows plus **custom code actions** (Data Hub, formerly Operations Hub, Professional or above at the time of writing) | The workflow and its code step | **Automation → Workflows → Create workflow**; the action list has **Custom code** |
 | HubSpot's Stripe Data Sync, syncing **payments** into a custom object | Any plan that includes Data Sync | The payment records the workflow enrolls. See [hubspot-stripe-data-sync-setup-and-recovery](https://github.com/carljibrilsulaimanii/hubspot-stripe-data-sync-setup-and-recovery). | A recent Stripe payment appears in that object with its PaymentIntent id (`pi_...`) |
 | Stripe | Any account selling plans through Payment Links in subscription mode | The subscriptions this ends | **Product catalog**: the plan's price is recurring |
-| Slack connected to HubSpot | Optional | The error alert in Step 4f | The workflow action list has **Send Slack notification** |
+| Slack connected to HubSpot | Optional | The error alert in Step 4f and the daily summary in Step 11 | The workflow action list has **Send Slack notification** |
+| HubSpot custom objects | Enterprise (any hub) at the time of writing | Part 2 only: the Payment Product Config object | **Settings → Data Management → Objects** offers **Create custom object** |
+| HubSpot's Stripe Data Sync, syncing **subscriptions** into a custom object | Same as above | Part 2 only: the records the Set end date workflow enrolls | A new Stripe subscription appears in that object with its id (`sub_...`) |
+| Scheduled workflows | Workflows with **Based on a schedule** triggers | Part 2 only: the daily check | The trigger picker offers **Based on a schedule** (wording may differ) |
 
 **Permissions and scopes**
 
@@ -113,6 +134,8 @@ date is there, every later run returns `ALREADY_SET`.
 | HubSpot user | Can create workflows and manage secrets | Steps 4 and 5 | You can open **Secrets** in a custom code action |
 | Stripe user | Can create restricted keys (Administrator or Developer) | Step 2 | **Developers → API keys** shows **Create restricted key** |
 | Stripe restricted key, stored as HubSpot secret `Stripe_Subscription_End` | **Subscriptions: Write**, **Invoices: Read**, **PaymentIntents: Read**, **Products: Read**; everything else None | The code reads the payment, invoice, subscription and product, and writes only `cancel_at` | The key's permission list shows exactly those four |
+| HubSpot service key, stored as HubSpot secret `Payment_Rules_Token` | `crm.objects.custom.read`, `crm.objects.custom.write` | Part 2 only: the actions read rules and create draft rules | The key's page lists those two scopes |
+| HubSpot user for Part 2 | Can create custom objects and properties (Super Admin, or the data management permission) | Steps 7 and 8 | You can open **Settings → Data Management → Objects** |
 
 **Tools with versions**
 
@@ -340,6 +363,265 @@ button to enroll their first payment.
 ✅ **Check:** the next buyer of the new plan shows `SET` in the workflow history
 within a few minutes of paying.
 
+## Part 2: the rules table
+
+Part 2 moves the plan list out of the code and into HubSpot records. It replaces the
+Part 1 workflow once it's on (Step 12); don't run both on the same plans for long.
+
+```text
+ New Stripe subscription ──► Data Sync ──► subscription record (sub_...)
+                                              │
+       Workflow "Payment plans - Set end date"│
+       custom code: subscription ─► price ─► rule in Payment Product Config
+         no rule ───────────► draft rule (needs setup) + Slack
+         renews / ignore ───► nothing
+         ends after N ──────► Global write mode on?  yes ─► cancel_at set (SET)
+                                                     no ──► WOULD_SET (report only)
+
+       Workflow "Payment plans - Daily check" (Global record, every morning)
+       for each "ends after N" rule ─► every live subscription on that price:
+         no end date ─► set it (write mode) or report it
+         end date off the rule, overpaid, past its end ─► report, never change
+       summary ─► Global record + Slack
+```
+
+### Step 7: The Payment Product Config object
+
+About 20 minutes.
+
+**7a.** **Settings → Data Management → Objects → Create custom object** (wording may
+differ). Singular name `Payment Product Config`, plural `Payment Product Configs`.
+Primary display property: **Name**.
+
+**7b.** Associate it with your Stripe subscriptions object and your Stripe payments
+object (**Associations** tab on the object's settings).
+
+**7c.** Create these properties on the object. The internal values of the dropdowns
+must be exactly as shown, because the code compares them:
+
+| Property (internal name) | Field type | Options: label → internal value | What it's for |
+|---|---|---|---|
+| `name` | Single-line text | | The plan, e.g. "Course: Payment Plan" |
+| `record_type` | Dropdown select | Product → `product`, Global → `global` | One Global record holds the settings; every other record is a plan price |
+| `stripe_price_id` | Single-line text, **Require unique values** on | | The plan's recurring price, `price_...` |
+| `stripe_product_id` | Single-line text | | The Stripe product, `prod_...` |
+| `plan_type` | Dropdown select | Ends after a set number of payments → `ends`, Renews until cancelled → `renews`, Not ours (ignore) → `ignore` | What happens to subscriptions on this price |
+| `total_payments` | Number | | How many payments the plan takes |
+| `active` | Single checkbox | | Off for a retired price |
+| `needs_setup` | Single checkbox | | On for drafts the workflow creates |
+| `notes` | Multi-line text | | Who set the rule and why |
+| `plan_write_mode` | Dropdown select | On → `on`, Report only → `report_only` | Global record only: whether anything is written to Stripe |
+| `plan_last_check_at` | Date picker with time (wording may differ) | | Global record only: filled by the daily check |
+| `plan_last_check_summary` | Multi-line text | | Global record only: filled by the daily check |
+
+**7d.** Copy the object's type id (it looks like `2-12345678`; it's in the address bar
+when you open the object's records). Paste it into `CONFIG_OBJECT` at the top of
+**both** [`workflow-action/rules/set-end-date-from-rules.js`](workflow-action/rules/set-end-date-from-rules.js)
+and [`workflow-action/rules/daily-check.js`](workflow-action/rules/daily-check.js).
+Until you do, both actions stop with an error naming `CONFIG_OBJECT`.
+
+> ⚠️ **Other apps' subscriptions.** If another app creates subscriptions on your
+> Stripe account (a community or membership platform, for example), the actions skip
+> anything created through a connected app (`application` is set). If that app's prices
+> share a recognizable prefix, also add it to `IGNORE_PRICE_PREFIXES` in both files.
+
+✅ **Check:** the object exists with all twelve properties, and both files have your
+object type id.
+
+### Step 8: Rules for your plans and the Global record
+
+About 10 minutes.
+
+**8a.** Create one record per plan price:
+
+| Field | Example |
+|---|---|
+| Name | Course: Payment Plan |
+| Record type | Product |
+| Stripe price ID | `price_...` from **Product catalog → the product → the recurring price** |
+| Stripe product ID | `prod_...` |
+| Plan type | Ends after a set number of payments |
+| Number of payments | 3 |
+| Active | On |
+| Needs setup | Off |
+
+**8b.** Create one record for each recurring price that should **never** end (an
+annual membership, for example) with **Plan type** = *Renews until cancelled*. That
+stops it from showing up as a draft.
+
+**8c.** Create the **Global** record: Name `Global settings`, Record type *Global*,
+**Plan write mode** = *Report only*. Keep it on Report only until Step 12.
+
+✅ **Check:** one record per plan price with Active on, and exactly one Global
+record.
+
+### Step 9: A HubSpot service key and the second secret
+
+About 5 minutes.
+
+**9a.** In HubSpot's **Service Keys** page, click **Create service key**, name it for
+this job (for example `Payment plan rules`), add the scopes
+`crm.objects.custom.read` and `crm.objects.custom.write`, and click **Create**.
+
+**9b.** You'll add it as the secret `Payment_Rules_Token` in Steps 10 and 11. Both
+actions also use `Stripe_Subscription_End` from Step 2.
+
+> ⚠️ **Give this job its own key.** The rules actions only need custom-object access.
+> A shared key with broader scopes works too, until someone rotates it for another
+> integration and these actions fail with a 401 that names neither.
+
+✅ **Check:** a service key with exactly those two scopes.
+
+### Step 10: Workflow "Payment plans - Set end date"
+
+About 15 minutes.
+
+**10a. Create it.** **Automation → Workflows → Create workflow → From scratch**.
+Object type: your **Stripe subscriptions** object. Name it
+`Payment plans - Set end date`.
+
+**10b. Trigger.** Enroll records that meet custom conditions: **Status** is any of
+`active`, `trialing`, `past_due`. Leave **Re-enrollment** off: a subscription only
+needs its end date once.
+
+**10c. Custom code.** Click **+**, choose **Custom code**.
+
+1. **Language:** Node.js 20.x
+2. **Secrets:** `Stripe_Subscription_End` and `Payment_Rules_Token` (click **Add
+   secret** to create the second one with the key from Step 9).
+3. **Property to include in code:**
+
+   | Input name (left box) | Value (right box) |
+   |---|---|
+   | `subscriptionId` | The subscription's Stripe id property (enrolled record), `sub_...` |
+
+4. Delete the sample code and paste in **all** of
+   [`workflow-action/rules/set-end-date-from-rules.js`](workflow-action/rules/set-end-date-from-rules.js),
+   with your object type id in `CONFIG_OBJECT` (Step 7d).
+5. **Data outputs**, all type String:
+
+   | Output | Holds |
+   |---|---|
+   | `result` | `SET`, `WOULD_SET`, `ALREADY_SET`, `NO_RULE`, `RENEWS`, `IGNORED`, `SKIPPED` or `ERROR` |
+   | `subscriptionId` | The subscription |
+   | `cancelAt` | The end date (set, or would be set), ISO format |
+   | `totalPayments` | The number of payments used |
+   | `ruleId` | The rule record used, or the draft created |
+   | `detail` | A one-line explanation |
+
+**10d. Record the result on the subscription.** Create three properties on your
+Stripe subscriptions object: `plan_status` (single-line text), `plan_total_payments`
+(number) and `plan_end_date` (single-line text). Add an **Edit record** action after
+the code that sets them from the outputs `result`, `totalPayments` and `cancelAt`, so
+property history shows what was done.
+
+**10e. Branch and alert.** Add an **If/then branch** on `result` with two branches:
+`NO_RULE` and `ERROR`. On each, add **Send Slack notification** with the
+subscription, `detail` and (for `NO_RULE`) a link to the draft rule `ruleId`.
+
+**10f. Test action.** Pick a recent subscription on one of your plan prices and click
+**Test**. With the Global record on Report only, success is `WOULD_SET` with the
+`cancelAt` you expect. Nothing is written to Stripe.
+
+| `result` | Meaning | What to do |
+|---|---|---|
+| `SET` | End date written (write mode On) | Check it in Stripe |
+| `WOULD_SET` | Report only: this is what it would set | Compare with your plan |
+| `ALREADY_SET` | The subscription already has an end date or schedule | Nothing |
+| `NO_RULE` | No rule for the price, or the rule isn't finished; a draft was created | Fill in the draft (Step 8) |
+| `RENEWS` / `IGNORED` | The rule says leave it | Nothing |
+| `SKIPPED` | Another app's subscription, an ignored price, or not live | Nothing |
+| `ERROR` | Missing secret or object id, rule without a number of payments, end date in the past, or a Stripe/HubSpot error | Read `detail` |
+
+**10g.** Publish it. Leave existing records out for now; Step 12 covers past buyers.
+
+✅ **Check:** the test returned `WOULD_SET` with the right date, and a test on a price
+with no rule created a draft record with **Needs setup** on.
+
+### Step 11: Workflow "Payment plans - Daily check"
+
+About 15 minutes.
+
+**11a. Create it.** **Automation → Workflows → Create workflow → From scratch**.
+Object type: **Payment Product Config**. Name it `Payment plans - Daily check`.
+
+**11b. Trigger.** **Based on a schedule**, **Daily**, at a quiet time (for example
+7:00 AM in your time zone), with the filter **Record type** is *Global* (wording may
+differ). Only the Global record enrolls.
+
+> ⚠️ **Set the schedule in the editor.** If you edit this workflow through HubSpot's
+> API later, re-check the trigger: a save through the API can replace a scheduled
+> trigger with a plain filter trigger.
+
+**11c. Custom code.** Click **+**, choose **Custom code**.
+
+1. **Language:** Node.js 20.x
+2. **Secrets:** `Stripe_Subscription_End` and `Payment_Rules_Token`
+3. **Property to include in code:**
+
+   | Input name (left box) | Value (right box) |
+   |---|---|
+   | `writeMode` | **Plan write mode** (enrolled record) |
+
+4. Delete the sample code and paste in **all** of
+   [`workflow-action/rules/daily-check.js`](workflow-action/rules/daily-check.js),
+   with your object type id in `CONFIG_OBJECT`.
+5. **Data outputs:**
+
+   | Output | Type | Holds |
+   |---|---|---|
+   | `summary` | String | One line of totals, then one line per finding |
+   | `issues` | Number | How many things need a look (0 = all good) |
+   | `checked` | Number | Plan subscriptions checked |
+   | `fixed` | Number | End dates set this run (write mode) |
+   | `wouldFix` | Number | End dates it would set (report only) |
+   | `mismatches` | Number | End date differs from the rule |
+   | `overpaid` | Number | More paid invoices than the rule allows |
+   | `overdue` | Number | Should have ended, still charging |
+   | `needsSetup` | Number | Draft rules waiting to be filled in |
+   | `truncated` | String | `true` when the run stopped early for time |
+
+**11d. Save the summary.** Add an **Edit record** action on the enrolled (Global)
+record: **plan_last_check_at** = the time the action runs, **plan_last_check_summary**
+= `summary`.
+
+**11e. Alert only when needed.** Add an **If/then branch** on `issues` is greater
+than `0`, and on that branch **Send Slack notification** with `summary`.
+
+**11f. Test action**, then publish.
+
+> ⚠️ **HubSpot stops custom code after about 20 seconds.** The check stops starting
+> new subscriptions after 14 seconds and returns `truncated = true`. If that happens
+> often, run it twice a day or split your rules across two Global-style runs.
+
+✅ **Check:** the Global record shows a **Last check** time and a summary that matches
+what you know about your plans.
+
+### Step 12: Switch over from Part 1 and turn on write mode
+
+About 10 minutes, then a week of watching.
+
+**12a.** Turn on **Payment plans - Set end date** and **Payment plans - Daily check**.
+Keep the Global record on **Report only**.
+
+**12b.** Turn off the Part 1 workflow **Payment plan end date (Stripe)** the same day,
+so only one system writes end dates.
+
+**12c.** Read the daily summaries for a week. Every existing plan subscription that
+already has an end date should be quiet. Anything in `wouldFix` is a subscription the
+Part 1 workflow missed; anything in `mismatches` is worth a manual look.
+
+**12d.** Set the Global record's **Plan write mode** to **On**. From the next run,
+missing end dates are set, by the Set end date workflow for new subscriptions and by
+the daily check for existing ones.
+
+> ⚠️ **Changing a rule doesn't change existing customers.** Neither action ever moves
+> an end date that's already set. If a customer's plan really changed, change their
+> subscription by hand in Stripe.
+
+✅ **Check:** after write mode is on, the next new plan buyer's subscription record
+shows **plan_status** = `SET`, and the next daily summary has 0 issues.
+
 ## How the end date is worked out
 
 Stripe charges payment 1 on the subscription's **billing anchor** (the first charge,
@@ -368,6 +650,11 @@ Ending at the exact boundary means the last period is never cut short.
 | `ALREADY_SET` on a buyer you expected to change | The subscription already had an end date or a subscription schedule | Change it by hand if the existing date is wrong; the action never overwrites |
 | *"callback is not a function"* | Old copy of the action without the return fix | Paste the current file again (Step 4c) |
 | Test-mode payments enroll | Test payments share the object | Add the Record Environment filter (Step 4b) |
+| Part 2: `ERROR`, *"Set CONFIG_OBJECT…"* | The object type id placeholder is still in the code | Step 7d, in both files |
+| Part 2: every result is `WOULD_SET` | The Global record is on Report only, or there's no Global record | Step 12d |
+| Part 2: `NO_RULE` on a price that has a rule | The rule's **Active** is off or **Needs setup** is on, or the price id doesn't match exactly | Step 8 |
+| Part 2: the daily summary says *"stopped early: time limit"* | Too many plan subscriptions for one 20-second run | Step 11 warning |
+| Part 2: HubSpot 401 or 403 in `detail` | `Payment_Rules_Token` is missing a scope or attached to the wrong key | Step 9 |
 
 ## Limits
 
@@ -377,8 +664,15 @@ Ending at the exact boundary means the last period is never cut short.
 - **Plans that switch to another price** after the last payment (for example 3
   installments, then an annual renewal) need a two-phase Stripe subscription schedule,
   not an end date. The action leaves subscriptions with a schedule alone.
-- **The plan list lives in the code.** Each new plan is a one-line code change and a
-  republish. A rules table read at run time would remove that step.
+- **Part 1 keeps the plan list in the code.** Each new plan is a one-line code change
+  and a republish. Part 2 moves it into records.
+- **Part 2 finds unknown prices when a subscription starts, not before.** A new plan
+  link with no rule shows up as a draft after its first buyer, and only gets an end
+  date once the draft is filled in. Add the rule when you create the link.
+- **The daily check only looks at prices with an "ends" rule.** A plan price nobody
+  added a rule for is caught by the Set end date workflow's draft, not by the check.
+- **20 seconds per run.** The daily check covers as many plan subscriptions as fit
+  in about 14 seconds, then reports `truncated`.
 - **Only the first matching item counts.** A subscription with several recurring items
   gets its end date from the first item that matches `PLANS`.
 - **It needs the payment in HubSpot.** Payments that never sync (for example $0
@@ -393,6 +687,9 @@ Ending at the exact boundary means the last period is never cut short.
   product you listed. Every other subscription on the account is read and skipped.
 - Each write sends an idempotency key built from the subscription and the end date, so
   a retried run can't double-apply a different change.
+- Part 2's HubSpot key has only custom-object read and write. It can read and create
+  rule records; it can't touch contacts, deals or payments.
+- Part 2 writes nothing to Stripe while the Global record is on **Report only**.
 - Rotate the key in Stripe and update the secret if it's ever exposed. A new key
   doesn't cancel the old one; delete the old key in Stripe.
 
